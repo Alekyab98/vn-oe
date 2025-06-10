@@ -1,0 +1,106 @@
+SELECT
+  event_time AS event_time,
+  "ericsson" AS vendor,
+  fqdn,
+  labels,
+  KEY AS metric_name,
+  SAFE_CAST(increase_value AS BIGNUMERIC) AS metric_increase_value,
+  SAFE_CAST(sum_value AS BIGNUMERIC) AS metric_sum_value,
+  SAFE_CAST(p_90 AS BIGNUMERIC) AS metric_p_90_value,
+  SAFE_CAST(sum_by_value AS BIGNUMERIC) AS metric_sum_by_value,
+  trans_dt,
+  DATETIME(process_ts) AS schedule_time,
+  CURRENT_TIMESTAMP AS updated_timestamp
+FROM (
+  WITH event_timestamps AS (
+    SELECT DISTINCT DATETIME_TRUNC(TIMESTAMP(`timestamp`), HOUR) AS trans_hr
+    FROM `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+    WHERE DATETIME_TRUNC(TIMESTAMP(insert_date_utc), HOUR) IN UNNEST(
+      GENERATE_TIMESTAMP_ARRAY(
+        TIMESTAMP_SUB(DATETIME_TRUNC(TIMESTAMP(trans_ts), HOUR), INTERVAL window_interval - 1 HOUR),
+        DATETIME_TRUNC(TIMESTAMP(trans_ts), HOUR),
+        INTERVAL window_hour HOUR
+      )
+    )
+    AND trans_dt IS NOT NULL
+  ),
+
+  base_data AS (
+    SELECT *,
+      MD5(labels) AS checksum
+    FROM (
+      SELECT DISTINCT
+        TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(`timestamp`) / (window_hour * 3600)) * (window_hour * 3600) AS INT64)) AS event_time,
+        fqdn,
+        TO_JSON_STRING(JSON_REMOVE(SAFE.PARSE_JSON(labels),
+          '$.__name__','$.jobid','$.job','$.localdn','$.instance',
+          '$.write_relabel_group','$.kubernetes_namespace',
+          '$.kubernetes_pod_name','$.pod_name','$.applicationId','$.icr_group')) AS labels,
+        JSON_VALUE(labels,'$.instance') AS instance,
+        LOWER(name) AS KEY,
+        SAFE_CAST(NULLIF(value,'NaN') AS FLOAT64) AS value,
+        DATE(`timestamp`) AS trans_dt,
+        `timestamp`
+      FROM `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+      WHERE DATETIME_TRUNC(TIMESTAMP(`timestamp`), HOUR) IN (SELECT trans_hr FROM event_timestamps)
+        AND insert_date_utc > (SELECT MIN(trans_hr) FROM event_timestamps)
+        AND trans_dt IN (SELECT DATE(trans_hr) FROM event_timestamps)
+        AND trans_dt IS NOT NULL
+    )
+  ),
+
+  window_data AS (
+    SELECT *,
+      SAFE_CAST(LAG(value) OVER (
+        PARTITION BY fqdn, instance, checksum, KEY, DATETIME_TRUNC(`timestamp`, HOUR)
+        ORDER BY `timestamp`
+      ) AS FLOAT64) AS prev_value,
+      IF(value < LAG(value) OVER (
+        PARTITION BY fqdn, instance, checksum, KEY, DATETIME_TRUNC(`timestamp`, HOUR)
+        ORDER BY `timestamp`
+      ), 1, 0) AS has_reset,
+      
+      -- ✅ Sum by logic: get the last value in the hour window (latest timestamp)
+      FIRST_VALUE(value) OVER (
+        PARTITION BY trans_dt, event_time, fqdn, instance, checksum, KEY
+        ORDER BY `timestamp` DESC
+      ) AS sum_by_value
+    FROM base_data
+  ),
+
+  reset_adjusted AS (
+    SELECT
+      event_time,
+      fqdn,
+      instance,
+      trans_dt,
+      MAX(labels) AS labels,
+      checksum,
+      KEY,
+      SUM(value) AS sum_value,
+      SUM(CASE
+        WHEN prev_value IS NULL THEN 0
+        WHEN has_reset = 1 THEN value
+        ELSE value - IFNULL(prev_value, 0)
+      END) AS increase_value,
+      APPROX_QUANTILES(value, 100)[OFFSET(90)] AS p_90,
+      MAX(sum_by_value) AS sum_by_value
+    FROM window_data
+    GROUP BY trans_dt, event_time, instance, fqdn, checksum, KEY
+  )
+
+  SELECT
+    event_time,
+    fqdn,
+    trans_dt,
+    SAFE.PARSE_JSON(labels) AS labels,
+    checksum,
+    KEY,
+    SUM(increase_value) AS increase_value,
+    SUM(sum_value) AS sum_value,
+    APPROX_QUANTILES(p_90, 100)[OFFSET(90)] AS p_90,
+    MAX(sum_by_value) AS sum_by_value
+  FROM reset_adjusted
+  GROUP BY event_time, fqdn, trans_dt, labels, checksum, KEY
+  ORDER BY trans_dt, event_time, fqdn, checksum, KEY
+)
