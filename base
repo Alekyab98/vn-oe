@@ -1,0 +1,137 @@
+select
+ event_time as event_time,
+"ericsson" as  vendor,
+fqdn,
+labels,
+KEY as metric_name,
+safe_cast(increase_value as bignumeric) as metric_increase_value,
+safe_cast(sum_value as bignumeric) as metric_sum_value,
+safe_cast(p_90 as bignumeric) as metric_p_90_value,
+trans_dt,
+datetime(process_ts) as schedule_time,
+current_timestamp as updated_timestamp
+from
+(
+WITH event_timestamps as
+(
+---- Generates a set of hourly timestamps based on insert_date_utc and trans_ts to handle delayed data
+select distinct DATETIME_TRUNC(timestamp(`timestamp`),HOUR) as trans_hr from  `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+ ---- This includes not just the current hour, but also the past hours if their is any data delay
+  where DATETIME_TRUNC(timestamp(insert_date_utc),HOUR)  in
+  unnest(GENERATE_TIMESTAMP_ARRAY(TIMESTAMP_SUB(DATETIME_TRUNC(timestamp(trans_ts),HOUR),INTERVAL window_interval-1 HOUR),DATETIME_TRUNC(timestamp(trans_ts),HOUR),INTERVAL window_hour HOUR))
+--    and trans_dt=date(timestamp(trans_ts))
+   and trans_dt is not null-- need to check
+)
+,
+  base_data AS (
+  select *,
+  MD5(labels) as checksum
+  from (
+---- Round timestamp down to the nearest hour bucket
+  SELECT
+  distinct
+    TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(`timestamp`)/(window_hour*60*60)) * (window_hour*60*60) AS INT64)) AS event_time,
+    fqdn,
+---- clean and normalize label JSON by removing unnecessary fields
+   TO_JSON_STRING(JSON_REMOVE(SAFE.PARSE_JSON(labels),'$.__name__','$.jobid','$.job','$.localdn','$.instance','$.write_relabel_group','$.kubernetes_namespace','$.kubernetes_pod_name','$.pod_name','$.applicationId','$.icr_group')) as labels,
+   JSON_VALUE(labels,'$.instance') as instance,
+    lower(name) as KEY,
+    SAFE_CAST(nullif(value,'NaN') AS FLOAT64) AS value,
+    DATE(`timestamp`) AS trans_dt,
+    `timestamp`,
+  FROM
+    `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+---- Filter data that belongs to the event windowWHERE
+    DATETIME_TRUNC(timestamp(`timestamp`),HOUR) in (select trans_hr from event_timestamps)
+---- Consider only data inserted after the window start
+    and insert_date_utc > (select min(trans_hr) from event_timestamps)
+and trans_dt in (select date(trans_hr) from event_timestamps)
+and trans_dt is not null
+)
+),
+---- identify metric resets using lag function
+window_data AS (
+---- Check if value has reset comparing it to the previous value
+select *,if(value<prev_value,1,0) has_reset from (
+select
+   trans_dt,
+   event_time,
+   fqdn,
+   labels,
+   checksum,
+   instance,
+   KEY,
+   value,
+   `timestamp`,
+---- Apply lag logic to get previous value for each metric_name,fqdn, checksum and instance combination in case of reset and calculate increase value
+   SAFE_CAST(LAG(value) OVER (PARTITION BY fqdn, instance, checksum, KEY, DATETIME_TRUNC(timestamp,HOUR) ORDER BY `timestamp`) AS FLOAT64) AS prev_value
+from base_data
+)
+),
+  reset_adjusted AS (
+  SELECT
+    event_time,
+    fqdn,
+    instance,
+    trans_dt,
+    MAX(labels) AS labels,
+    checksum,
+    KEY,
+    sum(value) as sum_value,---- sum all the values over the hour
+    SUM(CASE
+        WHEN prev_value is NULL THEN 0 ---- skip first record of each partition
+        WHEN has_reset =1 THEN value   ---- full value if reset occured
+        ELSE value - IFNULL(prev_value,0)-- Difference otherwise
+    END
+      ) AS increase_value,
+---- Approximate 90th percentile from the value distribution
+    APPROX_QUANTILES(value, 100)[OFFSET(90)] as p_90 
+  FROM
+    window_data
+  GROUP BY
+   trans_dt,
+   event_time,
+   instance,
+   fqdn,
+   checksum,
+   KEY )
+---- Aggregate instance level to get total increase/sum/p_90 value per metric and fqdn 
+SELECT
+  event_time,
+  fqdn,
+  trans_dt,
+  SAFE.PARSE_JSON(labels)  AS labels,---- convert labels string back to JSON object
+  checksum,
+  KEY,
+  increase_value,
+  sum_value,
+  p_90
+FROM (
+  SELECT
+  event_time,
+  fqdn,
+  trans_dt,
+  labels,
+  checksum,
+  KEY,
+---- Final aggregation for metrics
+  SUM(increase_value) AS increase_value,
+  SUM(sum_value) AS sum_value,
+  APPROX_QUANTILES(p_90, 100)[OFFSET(90)] as p_90  
+FROM
+  reset_adjusted
+GROUP BY   
+  event_time,
+  fqdn,
+  trans_dt,
+  labels,  
+  checksum,
+  KEY
+)
+ORDER BY
+  trans_dt,
+  event_time,
+  fqdn,
+  checksum,
+  KEY
+  )
